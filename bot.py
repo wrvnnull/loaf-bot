@@ -33,10 +33,12 @@ IMPORTANT:
 
 import os
 import sys
+import json
 import time
 import logging
 import secrets
 import requests
+from websockets.sync.client import connect as ws_connect
 
 # --------------------------------------------------------------------------
 # Configuration (all from environment variables / GitHub Secrets)
@@ -112,27 +114,83 @@ def get_properties():
     return live
 
 
-_debug_book_dumped = False
+def _ws_url_from_base(base: str) -> str:
+    host = base.split("://", 1)[-1].rstrip("/")
+    return f"wss://{host}/ws"
 
 
-def get_book(token_name: str):
+WS_URL = _ws_url_from_base(LOAF_API_BASE)
+WS_SUBSCRIBE_TIMEOUT = env_float("WS_SUBSCRIBE_TIMEOUT", 8)
+
+_ws_debug_dumped = 0
+_WS_DEBUG_MAX = 10
+
+
+def fetch_books_via_websocket(properties: list) -> dict:
     """
-    Public endpoint, embedded order-book snapshot for a single token.
+    NOTE ON THIS FUNCTION'S RELIABILITY:
+    GET /api/trade/:tokenName was assumed (per the tutorial) to return an
+    embedded order-book snapshot, but in production it actually returns a
+    flat property metadata list (propertyList) with NO bids/asks at all —
+    confirmed via debug logging. The only book data documented anywhere is
+    the WebSocket orderbook_update message shape, so this function connects
+    to the WebSocket and subscribes per property to get that.
 
-    NOTE: the exact response shape for this endpoint isn't confirmed from
-    the docs alone (only the WebSocket orderbook_update shape is documented
-    with bids/asks). best_bid_ask() below tries a couple of reasonable
-    shapes defensively. If neither matches your real response, check the
-    Action logs and adjust best_bid_ask() to match.
+    HOWEVER: the docs only specify the shape of incoming orderbook_update
+    messages, not the exact JSON you're supposed to SEND to subscribe. This
+    sends a best-guess frame: {"type": "subscribe", "channel": "orderbook:<id>"}.
+    If no book ever arrives, check the "[WS DEBUG]" log lines this prints —
+    they show the raw first few messages received (or connection errors),
+    which is the fastest way to figure out the real subscribe format.
+
+    Returns: {propertyId: {"bids": [...], "asks": [...]}} for whichever
+    properties responded within WS_SUBSCRIBE_TIMEOUT seconds.
     """
-    global _debug_book_dumped
-    r = session.get(f"{LOAF_API_BASE}/api/trade/{token_name}", timeout=10)
-    r.raise_for_status()
-    data = r.json()
-    if not _debug_book_dumped:
-        log.info("[DEBUG] Raw GET /api/trade/%s response: %s", token_name, str(data)[:2000])
-        _debug_book_dumped = True
-    return data
+    global _ws_debug_dumped
+    books: dict = {}
+    pending = {p["propertyId"] for p in properties}
+
+    try:
+        with ws_connect(WS_URL, open_timeout=10) as ws:
+            for p in properties:
+                sub = {"type": "subscribe", "channel": f"orderbook:{p['propertyId']}"}
+                ws.send(json.dumps(sub))
+
+            deadline = time.time() + WS_SUBSCRIBE_TIMEOUT
+            while pending and time.time() < deadline:
+                remaining = max(0.1, deadline - time.time())
+                try:
+                    raw = ws.recv(timeout=remaining)
+                except TimeoutError:
+                    break
+
+                if _ws_debug_dumped < _WS_DEBUG_MAX:
+                    log.info("[WS DEBUG] Raw message: %s", str(raw)[:1000])
+                    _ws_debug_dumped += 1
+
+                try:
+                    msg = json.loads(raw)
+                except (ValueError, TypeError):
+                    continue
+
+                if msg.get("type") == "orderbook_update" and "propertyId" in msg:
+                    pid = msg["propertyId"]
+                    if pid in pending:
+                        books[pid] = {
+                            "bids": msg.get("bids", []),
+                            "asks": msg.get("asks", []),
+                        }
+                        pending.discard(pid)
+    except Exception as e:  # noqa: BLE001 - connection/handshake errors, log and move on
+        log.error("[WS DEBUG] WebSocket connection/subscribe failed: %s", e)
+
+    if pending:
+        log.warning(
+            "No orderbook_update received via WebSocket for propertyIds: %s",
+            sorted(pending),
+        )
+
+    return books
 
 
 def get_active_orders():
@@ -217,20 +275,9 @@ def cancel_all():
 # --------------------------------------------------------------------------
 
 def best_bid_ask(book: dict):
-    """
-    Tries a couple of reasonable shapes for GET /api/trade/:tokenName since
-    only the WebSocket orderbook_update shape is documented explicitly:
-      { "bids": [{"price": ..., "quantity": ..., "orderId": ...}, ...],
-        "asks": [...] }
-    ...possibly nested under "orderbook". Falls back gracefully to (None, None)
-    if neither shape matches, which just makes run_cycle() skip that property.
-    """
-    node = book
-    if "bids" not in node and "asks" not in node and isinstance(book.get("orderbook"), dict):
-        node = book["orderbook"]
-
-    bids = node.get("bids") or []
-    asks = node.get("asks") or []
+    """book is {"bids": [...], "asks": [...]} as delivered by orderbook_update."""
+    bids = book.get("bids") or []
+    asks = book.get("asks") or []
     if not bids or not asks:
         return None, None
     best_bid = max(bids, key=lambda x: x["price"])["price"]
@@ -238,11 +285,10 @@ def best_bid_ask(book: dict):
     return best_bid, best_ask
 
 
-def run_cycle_for_property(prop: dict, active_orders: list):
+def run_cycle_for_property(prop: dict, active_orders: list, book: dict):
     token_name = prop["tokenName"]
     property_id = prop["propertyId"]
 
-    book = get_book(token_name)
     best_bid, best_ask = best_bid_ask(book)
 
     if best_bid is None or best_ask is None:
@@ -320,9 +366,18 @@ def run_pass():
     log.info("Pass covering %d live properties: %s",
               len(properties), ", ".join(p["tokenName"] for p in properties))
 
+    books = fetch_books_via_websocket(properties)
+
     for prop in properties:
+        book = books.get(prop["propertyId"])
+        if book is None:
+            log.warning(
+                "[%s] Risk event: no order book received via WebSocket, skipping this cycle.",
+                prop["tokenName"],
+            )
+            continue
         try:
-            run_cycle_for_property(prop, active_orders)
+            run_cycle_for_property(prop, active_orders, book)
         except requests.HTTPError as e:
             log.error("[%s] HTTP error during cycle: %s", prop.get("tokenName"), e)
         except Exception as e:  # noqa: BLE001 - one property's failure shouldn't stop the rest
