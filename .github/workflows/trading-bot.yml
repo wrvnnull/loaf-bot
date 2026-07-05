@@ -1,0 +1,44 @@
+name: Loaf Trading Bot
+
+on:
+  schedule:
+    # Minimum interval GitHub Actions supports is every 5 minutes.
+    # The bot itself loops internally for RUN_DURATION_SECONDS each run,
+    # so back-to-back 5-minute triggers give near-continuous coverage.
+    - cron: "*/5 * * * *"
+  workflow_dispatch: {}   # lets you trigger a run manually from the Actions tab
+
+# Prevent overlapping runs from piling up if one run is still finishing.
+concurrency:
+  group: loaf-trading-bot
+  cancel-in-progress: false
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8   # safety margin above RUN_DURATION_SECONDS
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run bot
+        env:
+          LOAF_API_BASE: ${{ secrets.LOAF_API_BASE }}
+          LOAF_API_KEY: ${{ secrets.LOAF_API_KEY }}
+          PROPERTY_ALLOWLIST: ${{ vars.PROPERTY_ALLOWLIST }}
+          TICK_SIZE_PCT: ${{ vars.TICK_SIZE_PCT }}
+          ORDER_SIZE: ${{ vars.ORDER_SIZE }}
+          MAX_INVENTORY: ${{ vars.MAX_INVENTORY }}
+          MAX_SPREAD_PCT: ${{ vars.MAX_SPREAD_PCT }}
+          REQUOTE_TOLERANCE_PCT: ${{ vars.REQUOTE_TOLERANCE_PCT }}
+          TICK_SLEEP_SECONDS: ${{ vars.TICK_SLEEP_SECONDS }}
+          RUN_DURATION_SECONDS: ${{ vars.RUN_DURATION_SECONDS }}
+        run: python bot.py
