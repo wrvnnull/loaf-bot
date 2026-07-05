@@ -126,80 +126,18 @@ _ws_debug_dumped = 0
 _WS_DEBUG_MAX = 10
 
 
-_ws_probed = False
-
-
-def _probe_ws_subscribe_formats(property_id: int):
-    """
-    Runs ONCE per script execution. Tries several plausible subscribe frame
-    shapes against the real WebSocket and logs the server's raw response to
-    each, since the docs only specify the incoming orderbook_update shape,
-    not what a client is supposed to send to subscribe. Use these logs to
-    pin down the correct format, then fetch_books_via_websocket() below can
-    be updated to send only that one.
-    """
-    global _ws_probed
-    if _ws_probed:
-        return
-    _ws_probed = True
-
-    candidates = [
-        {"type": "subscribe", "channel": f"orderbook:{property_id}"},
-        {"action": "subscribe", "channel": f"orderbook:{property_id}"},
-        {"type": "subscribe", "channel": "orderbook", "propertyId": property_id},
-        {"method": "subscribe", "channel": f"orderbook:{property_id}"},
-        {"op": "subscribe", "channel": f"orderbook:{property_id}"},
-        {"type": "subscribe", "channels": [f"orderbook:{property_id}"]},
-        {"type": "subscribe", "topic": f"orderbook:{property_id}"},
-    ]
-
-    try:
-        with ws_connect(WS_URL, open_timeout=10) as ws:
-            try:
-                first = ws.recv(timeout=3)
-                log.info("[WS PROBE] Initial message: %s", str(first)[:500])
-            except TimeoutError:
-                pass
-
-            for i, cand in enumerate(candidates, start=1):
-                try:
-                    ws.send(json.dumps(cand))
-                    log.info("[WS PROBE] Sent candidate %d: %s", i, json.dumps(cand))
-                except Exception as e:  # noqa: BLE001
-                    log.error("[WS PROBE] Send failed for candidate %d: %s", i, e)
-                    continue
-
-                deadline = time.time() + 2.0
-                got_reply = False
-                while time.time() < deadline:
-                    try:
-                        raw = ws.recv(timeout=max(0.1, deadline - time.time()))
-                    except TimeoutError:
-                        break
-                    got_reply = True
-                    log.info("[WS PROBE] Candidate %d response: %s", i, str(raw)[:500])
-                if not got_reply:
-                    log.info("[WS PROBE] Candidate %d: no response within 2s", i)
-    except Exception as e:  # noqa: BLE001
-        log.error("[WS PROBE] Connection failed: %s", e)
-
-
 def fetch_books_via_websocket(properties: list) -> dict:
     """
-    NOTE ON THIS FUNCTION'S RELIABILITY:
-    GET /api/trade/:tokenName was assumed (per the tutorial) to return an
-    embedded order-book snapshot, but in production it actually returns a
-    flat property metadata list (propertyList) with NO bids/asks at all —
-    confirmed via debug logging. The only book data documented anywhere is
-    the WebSocket orderbook_update message shape, so this function connects
-    to the WebSocket and subscribes per property to get that.
+    Connects to the Loaf WebSocket, subscribes to orderbook:{propertyId} for
+    every given property in ONE batched subscribe frame, and collects the
+    first orderbook_update snapshot for each.
 
-    HOWEVER: the docs only specify the shape of incoming orderbook_update
-    messages, not the exact JSON you're supposed to SEND to subscribe. This
-    sends a best-guess frame: {"type": "subscribe", "channel": "orderbook:<id>"}.
-    If no book ever arrives, check the "[WS DEBUG]" log lines this prints —
-    they show the raw first few messages received (or connection errors),
-    which is the fastest way to figure out the real subscribe format.
+    Confirmed subscribe frame format (found via probing the real server):
+        {"type": "subscribe", "channels": ["orderbook:<propertyId>", ...]}
+    Note "channels" (plural, array) -- NOT "channel" (singular string),
+    which the server rejects with {"type":"error","message":"Invalid message
+    format"}. Server replies {"type":"subscription_confirmed", ...} then
+    streams "orderbook_update" messages roughly once per second per channel.
 
     Returns: {propertyId: {"bids": [...], "asks": [...]}} for whichever
     properties responded within WS_SUBSCRIBE_TIMEOUT seconds.
@@ -208,14 +146,10 @@ def fetch_books_via_websocket(properties: list) -> dict:
     books: dict = {}
     pending = {p["propertyId"] for p in properties}
 
-    if properties:
-        _probe_ws_subscribe_formats(properties[0]["propertyId"])
-
     try:
         with ws_connect(WS_URL, open_timeout=10) as ws:
-            for p in properties:
-                sub = {"type": "subscribe", "channel": f"orderbook:{p['propertyId']}"}
-                ws.send(json.dumps(sub))
+            channels = [f"orderbook:{p['propertyId']}" for p in properties]
+            ws.send(json.dumps({"type": "subscribe", "channels": channels}))
 
             deadline = time.time() + WS_SUBSCRIBE_TIMEOUT
             while pending and time.time() < deadline:
