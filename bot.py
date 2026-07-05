@@ -120,7 +120,7 @@ def _ws_url_from_base(base: str) -> str:
 
 
 WS_URL = _ws_url_from_base(LOAF_API_BASE)
-WS_SUBSCRIBE_TIMEOUT = env_float("WS_SUBSCRIBE_TIMEOUT", 8)
+WS_SUBSCRIBE_TIMEOUT = env_float("WS_SUBSCRIBE_TIMEOUT", 12)
 
 _ws_debug_dumped = 0
 _WS_DEBUG_MAX = 10
@@ -198,13 +198,20 @@ def get_active_orders():
     return r.json().get("activeOrders", [])
 
 
-def _post_json(url: str, body=None):
+def _post_json(url: str, body=None, quiet_match=None):
     """
     session.post(...).raise_for_status() alone discards the response body,
-    but the API returns a useful "errorMessage" in that body on 4xx/5xx.
-    This logs it before raising, since a bare "400 Bad Request" with no
-    detail is close to useless for debugging (e.g. insufficient balance vs.
-    invalid nonce vs. rate limiting all look identical without this).
+    but the API returns a useful "error"/"errorMessage" in that body on
+    4xx/5xx. This logs it before raising, since a bare "400 Bad Request"
+    with no detail is close to useless for debugging.
+
+    quiet_match: optional callable(detail) -> bool. If it returns True for
+    a 4xx/5xx response, that's treated as an EXPECTED, recoverable
+    condition (e.g. "insufficient available balance" when you simply don't
+    hold enough of a token to sell it -- not a bug) rather than a bug: it's
+    logged at INFO level with no traceback, and no exception is raised. The
+    caller gets the raw Response back and can check response.status_code /
+    response.json() itself.
     """
     r = session.post(url, headers=HEADERS, json=body, timeout=10)
     if r.status_code >= 400:
@@ -212,9 +219,17 @@ def _post_json(url: str, body=None):
             detail = r.json()
         except ValueError:
             detail = r.text[:500]
+        if quiet_match and quiet_match(detail):
+            log.info("POST %s -> HTTP %s (expected): %s", url, r.status_code, detail)
+            return r
         log.error("POST %s -> HTTP %s: %s | body sent: %s", url, r.status_code, detail, body)
     r.raise_for_status()
     return r
+
+
+def _is_insufficient_balance(detail) -> bool:
+    msg = detail.get("error") or detail.get("errorMessage") if isinstance(detail, dict) else str(detail)
+    return bool(msg) and "insufficient" in msg.lower() and "balance" in msg.lower()
 
 
 def request_nonce():
@@ -235,7 +250,17 @@ def place_order(property_id: int, side: str, price: float, quantity: float):
         "deadline": 0,
         "nonce": nonce,
     }
-    r = _post_json(f"{LOAF_API_BASE}/api/orders/", body)
+    r = _post_json(f"{LOAF_API_BASE}/api/orders/", body, quiet_match=_is_insufficient_balance)
+    if r.status_code >= 400:
+        # Expected/recoverable: not enough available balance of this token
+        # right now (e.g. it's tied up in another resting order, or your
+        # test-funded holdings for this property are just low). Not a bug --
+        # just skip this side for this cycle, next pass will retry.
+        log.info(
+            "[propertyId=%s] Skipped %s %.1f: insufficient available balance right now.",
+            property_id, side, quantity,
+        )
+        return None
     data = r.json()
     if not data.get("success"):
         log.warning("[propertyId=%s] Order rejected: %s", property_id, data.get("errorMessage"))
