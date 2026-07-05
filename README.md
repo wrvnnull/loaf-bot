@@ -31,20 +31,14 @@ ada listing baru atau delisting, bot otomatis ikut menyesuaikan.
   di web app sebelum jalanin dengan size besar.
 - Akun kamu harus sudah **trading enabled** (referral code / kompetisi), kalau
   belum, API order akan balas `403`.
-- **Order book sekarang diambil lewat WebSocket, bukan REST.** Ditemukan lewat
-  testing: `GET /api/trade/:tokenName` ternyata **bukan** order book snapshot
-  (asumsi awal dari tutorial salah) — endpoint itu cuma balikin daftar
-  metadata property (`propertyList`), sama sekali tanpa `bids`/`asks`. Book
-  data yang benar-benar ada cuma didokumentasikan lewat WebSocket
-  (`orderbook:{propertyId}` channel). **Format frame untuk *subscribe* ke
-  channel itu sendiri tidak didokumentasikan secara eksplisit** (cuma bentuk
-  pesan `orderbook_update` yang *masuk* yang didokumentasikan) — `bot.py`
-  mengirim frame tebakan `{"type": "subscribe", "channel": "orderbook:<id>"}`.
-  **Ini best-effort, belum terverifikasi.** Kalau di log Action kamu lihat
-  `"No orderbook_update received via WebSocket for propertyIds: [...]"`
-  terus-menerus, cari baris `[WS DEBUG]` di log yang sama (isinya pesan
-  mentah dari server atau error koneksi) dan kirim ke saya — dari situ saya
-  bisa perbaiki format subscribe-nya.
+- **Order book diambil lewat WebSocket** (bukan REST — `GET /api/trade/:tokenName`
+  ternyata cuma balikin metadata property, bukan book, terbukti lewat testing).
+  Format subscribe-nya **sudah dikonfirmasi lewat probing ke server asli**:
+  `{"type": "subscribe", "channels": ["orderbook:<propertyId>", ...]}` —
+  perhatikan `channels` (jamak, array), bukan `channel` (tunggal). Server
+  balas `subscription_confirmed` lalu streaming `orderbook_update` kira-kira
+  tiap 1 detik per channel. Ini sudah terverifikasi jalan dengan data book
+  asli (harga & quantity nyata), bukan tebakan lagi.
 - Trading SEMUA property live berarti jumlah API call per siklus jadi
   `~2 x jumlah_property` (fetch book + reconcile/requote). Kalau propertinya
   bertambah banyak, naikkan `TICK_SLEEP_SECONDS` atau batasi lewat
@@ -103,10 +97,11 @@ Setiap pass (`run_pass` di `bot.py`):
    (dan filter `PROPERTY_ALLOWLIST` kalau diisi).
 2. `GET /api/history/orders/active` sekali (bukan per-property, untuk hemat
    API call), lalu difilter per `propertyId` secara lokal.
-3. Sekali per pass: koneksi WebSocket (`wss://.../ws`), subscribe channel
-   `orderbook:{propertyId}` untuk semua property, kumpulkan snapshot book
-   pertama yang masuk untuk tiap property (timeout `WS_SUBSCRIBE_TIMEOUT`
-   detik, default 8), lalu putus koneksi.
+3. Sekali per pass: koneksi WebSocket (`wss://.../ws`), kirim **satu** pesan
+   subscribe berisi semua channel sekaligus —
+   `{"type": "subscribe", "channels": ["orderbook:1", "orderbook:2", ...]}` —
+   kumpulkan snapshot book pertama yang masuk untuk tiap property (timeout
+   `WS_SUBSCRIBE_TIMEOUT` detik, default 8), lalu putus koneksi.
 4. Untuk tiap property:
    - Kalau salah satu sisi book kosong atau spread terlalu lebar → skip
      property ini untuk siklus ini (risk event); property lain tetap jalan.
@@ -133,9 +128,9 @@ Setiap pass (`run_pass` di `bot.py`):
 
 - Uji dulu dengan `PROPERTY_ALLOWLIST` berisi 1 token, size kecil, beberapa
   hari, sebelum melepas ke semua property.
-- Verifikasi shape respons `GET /api/trade/:tokenName` cocok dengan yang
-  diasumsikan `best_bid_ask()` — cek log Action untuk pesan
-  "missing book side" yang berulang.
+- Cek log Action untuk baris `[%s] Cycle done. mid=... spread=...` — itu
+  tandanya book berhasil didapat dan quote logic jalan. Kalau muncul
+  `"Placed BUY/SELL ..."`, itu tandanya order beneran terkirim ke exchange.
 - Tambahkan alerting (mis. notifikasi kalau satu property gagal berkali-kali).
 - Simpan API key hanya sebagai GitHub Secret, jangan pernah commit ke kode.
 - Cek ulang batas KYC, position limit, dan aturan yurisdiksi sebelum
