@@ -42,7 +42,16 @@ import requests
 # Configuration (all from environment variables / GitHub Secrets)
 # --------------------------------------------------------------------------
 
-LOAF_API_BASE = os.environ.get("LOAF_API_BASE", "https://api.loafmarkets.com")
+def env_float(name: str, default: float) -> float:
+    """os.environ.get() but treats an unset OR empty-string value as
+    'use the default'. GitHub Actions passes unset repo Variables through
+    as empty strings rather than omitting the env var entirely, which
+    would otherwise crash float('')."""
+    val = os.environ.get(name, "").strip()
+    return float(val) if val else default
+
+
+LOAF_API_BASE = os.environ.get("LOAF_API_BASE", "").strip() or "https://api.loafmarkets.com"
 LOAF_API_KEY = os.environ["LOAF_API_KEY"]  # required, no default on purpose
 
 # Comma-separated tokenNames to restrict trading to (e.g. "opera,eiffel").
@@ -59,15 +68,15 @@ PROPERTY_ALLOWLIST = (
 # expressed as a PERCENTAGE of mid price rather than a fixed absolute value,
 # because price scale varies enormously across properties (e.g. ~$97 for
 # "rainier" vs ~$1189 for "liberty").
-TICK_SIZE_PCT = float(os.environ.get("TICK_SIZE_PCT", "0.001"))       # 0.1% of mid
-ORDER_SIZE = float(os.environ.get("ORDER_SIZE", "1"))
-MAX_INVENTORY = float(os.environ.get("MAX_INVENTORY", "10"))
-MAX_SPREAD_PCT = float(os.environ.get("MAX_SPREAD_PCT", "0.05"))      # 5% of mid
-REQUOTE_TOLERANCE_PCT = float(os.environ.get("REQUOTE_TOLERANCE_PCT", "0.002"))
-TICK_SLEEP_SECONDS = float(os.environ.get("TICK_SLEEP_SECONDS", "10"))
+TICK_SIZE_PCT = env_float("TICK_SIZE_PCT", 0.001)          # 0.1% of mid
+ORDER_SIZE = env_float("ORDER_SIZE", 1)
+MAX_INVENTORY = env_float("MAX_INVENTORY", 10)
+MAX_SPREAD_PCT = env_float("MAX_SPREAD_PCT", 0.05)         # 5% of mid
+REQUOTE_TOLERANCE_PCT = env_float("REQUOTE_TOLERANCE_PCT", 0.002)
+TICK_SLEEP_SECONDS = env_float("TICK_SLEEP_SECONDS", 10)
 
 # Bounded run duration per invocation (GitHub Actions can't loop forever)
-RUN_DURATION_SECONDS = float(os.environ.get("RUN_DURATION_SECONDS", "240"))
+RUN_DURATION_SECONDS = env_float("RUN_DURATION_SECONDS", 240)
 
 HEADERS = {
     "Authorization": f"Bearer {LOAF_API_KEY}",
