@@ -112,6 +112,9 @@ def get_properties():
     return live
 
 
+_debug_book_dumped = False
+
+
 def get_book(token_name: str):
     """
     Public endpoint, embedded order-book snapshot for a single token.
@@ -122,9 +125,14 @@ def get_book(token_name: str):
     shapes defensively. If neither matches your real response, check the
     Action logs and adjust best_bid_ask() to match.
     """
+    global _debug_book_dumped
     r = session.get(f"{LOAF_API_BASE}/api/trade/{token_name}", timeout=10)
     r.raise_for_status()
-    return r.json()
+    data = r.json()
+    if not _debug_book_dumped:
+        log.info("[DEBUG] Raw GET /api/trade/%s response: %s", token_name, str(data)[:2000])
+        _debug_book_dumped = True
+    return data
 
 
 def get_active_orders():
