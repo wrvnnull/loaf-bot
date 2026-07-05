@@ -198,13 +198,27 @@ def get_active_orders():
     return r.json().get("activeOrders", [])
 
 
-def request_nonce():
-    r = session.post(
-        f"{LOAF_API_BASE}/api/orders/nonce",
-        headers=HEADERS,
-        timeout=10,
-    )
+def _post_json(url: str, body=None):
+    """
+    session.post(...).raise_for_status() alone discards the response body,
+    but the API returns a useful "errorMessage" in that body on 4xx/5xx.
+    This logs it before raising, since a bare "400 Bad Request" with no
+    detail is close to useless for debugging (e.g. insufficient balance vs.
+    invalid nonce vs. rate limiting all look identical without this).
+    """
+    r = session.post(url, headers=HEADERS, json=body, timeout=10)
+    if r.status_code >= 400:
+        try:
+            detail = r.json()
+        except ValueError:
+            detail = r.text[:500]
+        log.error("POST %s -> HTTP %s: %s | body sent: %s", url, r.status_code, detail, body)
     r.raise_for_status()
+    return r
+
+
+def request_nonce():
+    r = _post_json(f"{LOAF_API_BASE}/api/orders/nonce")
     data = r.json()
     return data["nonce"], data["deadline"]
 
@@ -221,13 +235,7 @@ def place_order(property_id: int, side: str, price: float, quantity: float):
         "deadline": 0,
         "nonce": nonce,
     }
-    r = session.post(
-        f"{LOAF_API_BASE}/api/orders/",
-        headers=HEADERS,
-        json=body,
-        timeout=10,
-    )
-    r.raise_for_status()
+    r = _post_json(f"{LOAF_API_BASE}/api/orders/", body)
     data = r.json()
     if not data.get("success"):
         log.warning("[propertyId=%s] Order rejected: %s", property_id, data.get("errorMessage"))
@@ -240,13 +248,7 @@ def place_order(property_id: int, side: str, price: float, quantity: float):
 
 
 def cancel_order(order_id: int):
-    r = session.post(
-        f"{LOAF_API_BASE}/api/orders/cancel",
-        headers=HEADERS,
-        json={"orderId": order_id},
-        timeout=10,
-    )
-    r.raise_for_status()
+    r = _post_json(f"{LOAF_API_BASE}/api/orders/cancel", {"orderId": order_id})
     data = r.json()
     if not data.get("success"):
         log.warning("Cancel failed for %s: %s", order_id, data.get("errorMessage"))
@@ -256,12 +258,7 @@ def cancel_order(order_id: int):
 
 
 def cancel_all():
-    r = session.post(
-        f"{LOAF_API_BASE}/api/orders/cancel-all",
-        headers=HEADERS,
-        timeout=10,
-    )
-    r.raise_for_status()
+    r = _post_json(f"{LOAF_API_BASE}/api/orders/cancel-all")
     return r.json()
 
 
@@ -320,23 +317,29 @@ def run_cycle_for_property(prop: dict, active_orders: list, book: dict):
         for o in our_open
     )
 
-    # --- Bid side ---
-    if current_bid is None or abs(current_bid["price"] - our_bid_price) > requote_tolerance:
-        if current_bid is not None:
-            cancel_order(current_bid["orderId"])
-        if net_inventory < MAX_INVENTORY:
-            place_order(property_id, "BUY", our_bid_price, ORDER_SIZE)
-        else:
-            log.info("[%s] Skipping bid: inventory cap reached (%.1f)", token_name, net_inventory)
+    # --- Bid side --- (isolated: a failure here must not block the ask side)
+    try:
+        if current_bid is None or abs(current_bid["price"] - our_bid_price) > requote_tolerance:
+            if current_bid is not None:
+                cancel_order(current_bid["orderId"])
+            if net_inventory < MAX_INVENTORY:
+                place_order(property_id, "BUY", our_bid_price, ORDER_SIZE)
+            else:
+                log.info("[%s] Skipping bid: inventory cap reached (%.1f)", token_name, net_inventory)
+    except requests.HTTPError as e:
+        log.error("[%s] Bid requote failed: %s", token_name, e)
 
-    # --- Ask side ---
-    if current_ask is None or abs(current_ask["price"] - our_ask_price) > requote_tolerance:
-        if current_ask is not None:
-            cancel_order(current_ask["orderId"])
-        if net_inventory > -MAX_INVENTORY:
-            place_order(property_id, "SELL", our_ask_price, ORDER_SIZE)
-        else:
-            log.info("[%s] Skipping ask: inventory cap reached (%.1f)", token_name, net_inventory)
+    # --- Ask side --- (isolated: a failure here must not block the bid side)
+    try:
+        if current_ask is None or abs(current_ask["price"] - our_ask_price) > requote_tolerance:
+            if current_ask is not None:
+                cancel_order(current_ask["orderId"])
+            if net_inventory > -MAX_INVENTORY:
+                place_order(property_id, "SELL", our_ask_price, ORDER_SIZE)
+            else:
+                log.info("[%s] Skipping ask: inventory cap reached (%.1f)", token_name, net_inventory)
+    except requests.HTTPError as e:
+        log.error("[%s] Ask requote failed: %s", token_name, e)
 
     log.info(
         "[%s] Cycle done. mid=%.2f spread=%.2f (%.2f%%) inventory=%.1f",
